@@ -20,10 +20,17 @@ export interface TrayApp {
 
 const trayPath = (app: TrayApp) => app.path.toLowerCase().replace(/\\/g, "/");
 
+const isBrowserHostPath = (p: string) => /(msedge|chrome|brave|vivaldi|firefox)\.exe$/i.test(p);
+
 const ownsVisibleWindow = (window: AppInfo, tray: TrayApp) =>
 	(window.all_hwnds ?? (window.hwnd ? [[window.hwnd, window.name]] : [])).some(([hwnd]) =>
 		tray.window_handles.includes(hwnd as number)
-	);
+	) ||
+	// A window whose UI runs in a helper process (Steam's steamwebhelper.exe)
+	// is reported under the app's own exe; its tray icon belongs to that exe.
+	// Browser hosts are excluded: one exe hosts many unrelated web apps.
+	(!isBrowserHostPath(window.path) &&
+		window.path.toLowerCase().replace(/\\/g, "/") === trayPath(tray));
 
 // An unpinned notification icon becomes a dock item only after its app has
 // appeared with a window. Pinned apps are eligible immediately at startup.

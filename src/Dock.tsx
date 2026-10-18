@@ -49,6 +49,12 @@ export function isSameApp(a: AppInfo, b: AppInfo): boolean {
 	// Two opaque shell ids match only exactly (checked above).
 	if (aId && bId) return false;
 	if (aId !== bId) {
+		// A packaged app is the same app whether it is known by its AUMID
+		// (Microsoft.ScreenSketch_8wekyb3d8bbwe!App) or by an exe inside its
+		// package folder (…\WindowsApps\Microsoft.ScreenSketch_11.2608…\SnippingTool.exe):
+		// the exe name need not resemble the package name.
+		const aPkg = packageName(a.path);
+		if (aPkg && aPkg === packageName(b.path)) return true;
 		// One side is a shell id (AUMID), the other a file path. AUMIDs embed
 		// the product name (ZedIndustries.Zed, com.squirrel.Figma.Figma), so
 		// match on overlapping display names plus id/stem cross-containment.
@@ -75,6 +81,19 @@ export function isSameApp(a: AppInfo, b: AppInfo): boolean {
 
 const fileOf = (p: string) =>
 	(p.split("/").pop()?.split("\\").pop()?.toLowerCase() || "").replace(/\.lnk$/, "");
+
+// Package name of a packaged app, from its AUMID ("Microsoft.ScreenSketch_8wekyb3d8bbwe!App")
+// or from a path inside its install folder ("…\WindowsApps\Microsoft.ScreenSketch_11.2608.41.0_x64__…").
+export function packageName(p: string): string | null {
+	const lower = p.toLowerCase().replace(/\\/g, "/");
+	const fromPath = lower.match(/\/windowsapps\/([^/_]+)_/);
+	if (fromPath) return fromPath[1];
+	if (!lower.includes("/")) {
+		const fromId = lower.match(/^([^_!]+)_[a-z0-9]+!/);
+		if (fromId) return fromId[1];
+	}
+	return null;
+}
 
 // Shell application ids (AUMIDs) identify one specific app; two different PWAs
 // running in the same browser must never be matched by their shared exe name.
@@ -611,12 +630,30 @@ const Dock = memo(function Dock() {
 		}
 	};
 
+	// Some apps open their window only on a double-click of their tray icon
+	// (Steam), so a single tray activation shows nothing. A pinned item then
+	// does what the taskbar does for a pinned app without windows: it starts
+	// the saved target, which brings a single-instance app's window forward.
+	const launchIfTrayIgnored = (app: AppInfo) => {
+		window.setTimeout(async () => {
+			try {
+				const open = await invoke<AppInfo[]>("get_active_windows");
+				if (!open.some((w) => isSameApp(app, w))) {
+					await invoke("open_app", { appName: app.path });
+				}
+			} catch (e) {
+				console.error(`Failed to launch ${app.name} after its tray icon:`, e);
+			}
+		}, 1500);
+	};
+
 	const handleAppClick = async (app: AppInfo) => {
 		try {
 			if (app.path === "start") {
 				await invoke("open_app", { appName: "start" });
 			} else if (app.is_background && app.tray_ids?.length === 1) {
 				await invoke("activate_tray_icon", { trayId: app.tray_ids[0] });
+				if (app.is_pinned) launchIfTrayIgnored(app);
 			} else if (app.all_hwnds && app.all_hwnds.length > 1) {
 				// Several windows: bring the most recent forward, then cycle.
 				await invoke("focus_app_windows", { hwnds: app.all_hwnds.map(([hwnd]) => hwnd) });

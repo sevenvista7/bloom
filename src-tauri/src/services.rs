@@ -1317,6 +1317,8 @@ pub fn setup_system_worker(app_handle: AppHandle) -> Sender<SystemCommand> {
         };
         let mut last_visible = true;
         let mut last_dock_overlap: Option<bool> = None;
+        let mut held_dock_span: Option<(i32, i32)> = None;
+        let mut held_notch_span: Option<(i32, i32)> = None;
         let mut last_notch_overlap: Option<bool> = None;
         let mut last_dock_maximized: Option<bool> = None;
         let mut last_fg_maximized = false;
@@ -1349,9 +1351,11 @@ pub fn setup_system_worker(app_handle: AppHandle) -> Sender<SystemCommand> {
                 let mut hwnd = GetForegroundWindow();
 
                 // Find the first meaningful window for overlap detection.
-                // We skip Bloom windows, invisible windows, minimized windows, and 'cloaked' system ghosts.
+                // We skip Bloom windows, invisible windows, minimized windows, 'cloaked' system ghosts,
+                // and tool windows (floating overlays and widgets): they never cover the
+                // dock like an app does, so the app under them decides.
                 let mut check_count = 0;
-                while !hwnd.is_invalid() && check_count < 15 {
+                while !hwnd.is_invalid() && check_count < 64 {
                     let mut process_id = 0u32;
                     GetWindowThreadProcessId(hwnd, Some(&mut process_id));
 
@@ -1381,7 +1385,19 @@ pub fn setup_system_worker(app_handle: AppHandle) -> Sender<SystemCommand> {
                         && (rect.right - rect.left) > 0
                         && (rect.bottom - rect.top) > 0;
 
-                    if is_bloom || !is_visible || is_iconic || is_cloaked || !has_valid_rect {
+                    let is_tool =
+                        (GetWindowLongW(hwnd, windows::Win32::UI::WindowsAndMessaging::GWL_EXSTYLE)
+                            as u32
+                            & windows::Win32::UI::WindowsAndMessaging::WS_EX_TOOLWINDOW.0)
+                            != 0;
+
+                    if is_bloom
+                        || is_tool
+                        || !is_visible
+                        || is_iconic
+                        || is_cloaked
+                        || !has_valid_rect
+                    {
                         hwnd = windows::Win32::UI::WindowsAndMessaging::GetWindow(
                             hwnd,
                             windows::Win32::UI::WindowsAndMessaging::GW_HWNDNEXT,
@@ -1392,6 +1408,19 @@ pub fn setup_system_worker(app_handle: AppHandle) -> Sender<SystemCommand> {
                         break;
                     }
                 }
+
+                let dock_span = DOCK_RECT
+                    .lock()
+                    .ok()
+                    .and_then(|g| *g)
+                    .map(|dr| dock_span_px(dr, cached_scale));
+                // While overlapped, keep testing against the span the dock had when
+                // the overlap began: hiding shrinks DOCK_RECT to the 34px pill, and a
+                // window that only covers the expanded dock (e.g. Win+R's Run dialog)
+                // would stop overlapping, show the dock, overlap again, and flicker.
+                // DOCK_RECT itself must stay the live rect: the mouse hook hit-tests
+                // against it, and while hidden only the pill is clickable.
+                let overlap_span = held_dock_span.or(dock_span);
 
                 let mut should_overlap = false;
                 let mut should_notch_overlap = false;
@@ -1422,9 +1451,16 @@ pub fn setup_system_worker(app_handle: AppHandle) -> Sender<SystemCommand> {
                     let title = String::from_utf16_lossy(&text[..text_len as usize]);
 
                     let is_desktop = class_str == "Progman" || class_str == "WorkerW";
+                    // Start and Search are recognised by the process that hosts them:
+                    // their window title is localized ("Suche", "Recherche", ...).
+                    let mut start_pid = 0u32;
+                    GetWindowThreadProcessId(hwnd, Some(&mut start_pid));
+                    let host_exe = crate::commands::process_image_path(start_pid)
+                        .map(|p| p.rsplit('\\').next().unwrap_or("").to_lowercase())
+                        .unwrap_or_default();
                     let is_start = (class_str == "Windows.UI.Core.CoreWindow"
                         || class_str == "SimpleWindow")
-                        && (title == "Start" || title == "Search");
+                        && (title == "Start" || title == "Search" || is_start_menu_host(&host_exe));
                     let is_shell = class_str == "Shell_TrayWnd"
                         || class_str == "Shell_SecondaryTrayWnd"
                         || is_start;
@@ -1464,7 +1500,12 @@ pub fn setup_system_worker(app_handle: AppHandle) -> Sender<SystemCommand> {
                                     ..Default::default()
                                 };
 
-                                if GetMonitorInfoA(h_monitor, &mut mi).as_bool() {
+                                // The dock and notch live on the primary monitor. A maximized,
+                                // fullscreen or overlapping window on another monitor covers
+                                // neither, so only windows on the primary monitor count.
+                                if GetMonitorInfoA(h_monitor, &mut mi).as_bool()
+                                    && is_primary_monitor(mi.dwFlags)
+                                {
                                     let screen_rect = mi.rcMonitor;
                                     let is_maximized =
                                         IsZoomed(hwnd).as_bool() || (style & WS_MAXIMIZE.0) != 0;
@@ -1510,39 +1551,36 @@ pub fn setup_system_worker(app_handle: AppHandle) -> Sender<SystemCommand> {
                                         should_maximized = is_maximized && !current_is_fs;
                                     } else {
                                         should_overlap = false;
-                                        if let Ok(dock_rect_lock) = DOCK_RECT.lock() {
-                                            if let Some(dr) = *dock_rect_lock {
-                                                let scale = cached_scale;
-                                                let d_left = (dr.x as f64 * scale) as i32;
-                                                let d_right =
-                                                    d_left + (dr.width as f64 * scale) as i32;
-                                                let res_h = (56.0 * scale) as i32;
-                                                let trigger_y = screen_rect.bottom - res_h;
-
-                                                if rect.left < d_right - 4
-                                                    && rect.right > d_left + 4
-                                                    && rect.bottom > trigger_y + 4
-                                                {
-                                                    should_overlap = true;
-                                                }
-                                            }
+                                        if let Some(span) = overlap_span {
+                                            let res_h = (56.0 * cached_scale) as i32;
+                                            let trigger_y = screen_rect.bottom - res_h;
+                                            should_overlap = window_reaches_dock(
+                                                span,
+                                                (rect.left, rect.right, rect.bottom),
+                                                trigger_y,
+                                            );
                                         }
 
-                                        if let Ok(notch_rect_lock) = NOTCH_RECT.lock() {
-                                            if let Some(nr) = *notch_rect_lock {
-                                                let scale = cached_scale;
-                                                let n_left = (nr.x as f64 * scale) as i32;
-                                                let n_right =
-                                                    n_left + (nr.width as f64 * scale) as i32;
-                                                let res_h = (36.0 * scale) as i32;
-                                                let trigger_y = screen_rect.top + res_h;
+                                        let notch_span = held_notch_span.or_else(|| {
+                                            NOTCH_RECT
+                                                .lock()
+                                                .ok()
+                                                .and_then(|g| *g)
+                                                .map(|nr| dock_span_px(nr, cached_scale))
+                                        });
+                                        if let Some((n_left, n_right)) = notch_span {
+                                            // Same hold as the dock: while a window overlaps the
+                                            // notch, test against the span it had when the overlap
+                                            // began, so a notch that narrows when it hides cannot
+                                            // uncover the window and flicker.
+                                            let res_h = (36.0 * cached_scale) as i32;
+                                            let trigger_y = screen_rect.top + res_h;
 
-                                                if rect.left < n_right - 4
-                                                    && rect.right > n_left + 4
-                                                    && rect.top < trigger_y - 4
-                                                {
-                                                    should_notch_overlap = true;
-                                                }
+                                            if rect.left < n_right - 4
+                                                && rect.right > n_left + 4
+                                                && rect.top < trigger_y - 4
+                                            {
+                                                should_notch_overlap = true;
                                             }
                                         }
                                     }
@@ -1568,6 +1606,22 @@ pub fn setup_system_worker(app_handle: AppHandle) -> Sender<SystemCommand> {
                     .get_webview_window("dock")
                     .is_some_and(|w| w.is_visible().unwrap_or(false));
                 let effective_dock_overlap = should_overlap && dock_visible;
+                held_dock_span = if effective_dock_overlap {
+                    overlap_span
+                } else {
+                    None
+                };
+                held_notch_span = if should_notch_overlap {
+                    held_notch_span.or_else(|| {
+                        NOTCH_RECT
+                            .lock()
+                            .ok()
+                            .and_then(|g| *g)
+                            .map(|nr| dock_span_px(nr, cached_scale))
+                    })
+                } else {
+                    None
+                };
 
                 // Update overlap state
                 CURRENT_DOCK_OVERLAP.store(
@@ -1669,6 +1723,36 @@ pub fn setup_system_worker(app_handle: AppHandle) -> Sender<SystemCommand> {
     });
 
     tx
+}
+
+/// True for the monitor flagged primary in `MONITORINFO::dwFlags`
+/// (`MONITORINFOF_PRIMARY`), the one that hosts the dock and the notch.
+pub(crate) fn is_primary_monitor(monitor_flags: u32) -> bool {
+    (monitor_flags & windows::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY) != 0
+}
+
+/// Executables that host the Start menu and Search, by file name (lowercase).
+/// StartMenuExperienceHost on older Windows 11 builds, SearchHost on 24H2+.
+pub(crate) fn is_start_menu_host(exe_file_name: &str) -> bool {
+    exe_file_name == "searchhost.exe" || exe_file_name == "startmenuexperiencehost.exe"
+}
+
+/// The dock's horizontal span in physical px: `DOCK_RECT` is in CSS px.
+pub(crate) fn dock_span_px(dock: IntRect, scale: f64) -> (i32, i32) {
+    let left = (dock.x as f64 * scale) as i32;
+    (left, left + (dock.width as f64 * scale) as i32)
+}
+
+/// Smart-hide test: does the foreground window (left, right, bottom, physical
+/// px) reach into the dock's horizontal span below `trigger_y`?
+pub(crate) fn window_reaches_dock(
+    dock_span: (i32, i32),
+    win: (i32, i32, i32),
+    trigger_y: i32,
+) -> bool {
+    let (d_left, d_right) = dock_span;
+    let (left, right, bottom) = win;
+    left < d_right - 4 && right > d_left + 4 && bottom > trigger_y + 4
 }
 
 fn set_physical_monitors_brightness(brightness: u32) {
@@ -3032,6 +3116,16 @@ pub fn trigger_app_scan() {
                                         } else {
                                             name.clone()
                                         };
+                                        // Classic programs under Program Files come back as
+                                        // `{known-folder GUID}\…\app.exe`; store the real path
+                                        // so launching, icons and exe matching all work.
+                                        let path = if path.starts_with('{') {
+                                            crate::tray::resolve_path(&path)
+                                                .filter(|p| std::path::Path::new(p).exists())
+                                                .unwrap_or(path)
+                                        } else {
+                                            path
+                                        };
 
                                         if is_launchable_entry(&name, &path) {
                                             // AUMIDs have no executable of their own; storing the
@@ -3692,9 +3786,43 @@ pub unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> B
                         || lowercase_path.contains("\\windowsapps\\")
                         || is_browser_host
                     {
-                        crate::utils::get_window_app_user_model_id(hwnd)
+                        crate::utils::get_window_app_user_model_id(hwnd).or_else(|| {
+                            // A packaged app's window can carry no AUMID of its own
+                            // (Snipping Tool); the taskbar then groups it by the
+                            // package identity of its process.
+                            if lowercase_path.contains("\\windowsapps\\") && !is_uwp_frame {
+                                crate::utils::process_app_user_model_id(process_handle)
+                            } else {
+                                None
+                            }
+                        })
                     } else {
                         None
+                    };
+                    // Classic apps whose UI window belongs to a helper process name
+                    // their real executable in the window's relaunch command, which
+                    // is what the taskbar groups and pins (Steam's window belongs to
+                    // steamwebhelper.exe and relaunches Steam.exe). Use it as the
+                    // window's identity so it joins the app's dock item.
+                    let relaunch_exe = if !is_uwp_frame
+                        && !is_browser_host
+                        && !lowercase_path.contains("\\windowsapps\\")
+                    {
+                        crate::utils::get_window_relaunch_command(hwnd)
+                            .and_then(|command| crate::utils::relaunch_executable(&command))
+                            .filter(|exe| !exe.eq_ignore_ascii_case(&path))
+                    } else {
+                        None
+                    };
+                    let (path, exe_name) = match relaunch_exe {
+                        Some(exe) => {
+                            let file = Path::new(&exe)
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .map(|s| s.to_string());
+                            (exe, file)
+                        }
+                        None => (path, exe_name),
                     };
                     let is_browser_pwa = is_browser_host
                         && window_aumid
@@ -4063,8 +4191,63 @@ fn recover_from_webview_failure(handle: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_helper_name, is_launchable_entry, notch_mode_reserves_work_area, win_number_index,
+        dock_span_px, is_helper_name, is_launchable_entry, is_primary_monitor, is_start_menu_host,
+        notch_mode_reserves_work_area, win_number_index, window_reaches_dock,
     };
+    use crate::types::IntRect;
+
+    #[test]
+    fn only_windows_on_the_primary_monitor_cover_the_dock() {
+        assert!(is_primary_monitor(1));
+        assert!(!is_primary_monitor(0));
+    }
+
+    #[test]
+    fn start_menu_is_recognised_by_its_host_process() {
+        // The window title is localized ("Suche" on German Windows), the host is not.
+        assert!(is_start_menu_host("searchhost.exe"));
+        assert!(is_start_menu_host("startmenuexperiencehost.exe"));
+        assert!(!is_start_menu_host("explorer.exe"));
+        assert!(!is_start_menu_host(""));
+    }
+
+    #[test]
+    fn dock_span_is_scaled_to_physical_px() {
+        let dock = IntRect {
+            x: 320,
+            y: 0,
+            width: 640,
+            height: 34,
+        };
+        assert_eq!(dock_span_px(dock, 1.0), (320, 960));
+        // 150 %: a 1920 px screen is 1280 CSS px wide.
+        assert_eq!(dock_span_px(dock, 1.5), (480, 1440));
+    }
+
+    #[test]
+    fn held_dock_span_keeps_run_dialog_overlap_steady() {
+        // 1920 px wide screen at 150 %, Run dialog at the bottom left (about
+        // 600 px wide), a wide dock centred.
+        let run = (12, 620, 1190);
+        let trigger_y = 1200 - 84;
+        let expanded = (480, 1440);
+        let pill = (935, 985);
+        assert!(window_reaches_dock(expanded, run, trigger_y));
+        // The hidden dock is a pill the dialog never touches: on its own this
+        // would show the dock again and flicker...
+        assert!(!window_reaches_dock(pill, run, trigger_y));
+        // ...so the overlap thread tests against the span latched when the
+        // overlap began, and drops it once the window is clear.
+        let mut held: Option<(i32, i32)> = None;
+        for current in [expanded, pill, pill] {
+            let span = held.unwrap_or(current);
+            let overlap = window_reaches_dock(span, run, trigger_y);
+            assert!(overlap);
+            held = if overlap { Some(span) } else { None };
+        }
+        let moved = (12, 620, 900);
+        assert!(!window_reaches_dock(held.unwrap(), moved, trigger_y));
+    }
 
     #[test]
     fn win_number_maps_top_row_digits_only() {
