@@ -2206,6 +2206,7 @@ unsafe extern "system" fn capture_ui_enum_proc(hwnd: HWND, lparam: LPARAM) -> BO
         return BOOL(1);
     }
 
+    let mut candidate = false;
     let mut pid = 0u32;
     GetWindowThreadProcessId(hwnd, Some(&mut pid));
     if pid != 0 && pid != std::process::id() {
@@ -2226,14 +2227,14 @@ unsafe extern "system" fn capture_ui_enum_proc(hwnd: HWND, lparam: LPARAM) -> BO
                     || name == "screenclippinghost.exe"
                     || name == "screensketch.exe"
                 {
-                    *found = true;
+                    candidate = true;
                 }
             }
             let _ = CloseHandle(handle);
         }
     }
 
-    if !*found {
+    if !candidate {
         use windows::Win32::UI::WindowsAndMessaging::GetClassNameA;
         let mut class_buf = [0u8; 256];
         let len = GetClassNameA(hwnd, &mut class_buf);
@@ -2241,11 +2242,50 @@ unsafe extern "system" fn capture_ui_enum_proc(hwnd: HWND, lparam: LPARAM) -> BO
             .unwrap_or("")
             .to_lowercase();
         if class.contains("snipping") {
-            *found = true;
+            candidate = true;
         }
     }
 
+    if candidate && is_capture_surface(hwnd) {
+        *found = true;
+    }
     BOOL(1)
+}
+
+/// The Snipping Tool app window can stay open all day; only its capture
+/// surfaces (the dimmed selection overlay and the capture/recording toolbar)
+/// need Bloom out of the way. Those are topmost (the per-monitor overlays are
+/// topmost tool windows) or borderless; the regular
+/// app/editor window is a normal captioned window, also when maximized (a
+/// "covers its monitor" test would catch a maximized editor once Bloom hides
+/// the taskbar). Cloaked windows (other desktop, suspended app) are not shown.
+unsafe fn is_capture_surface(hwnd: HWND) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongW, GWL_EXSTYLE, GWL_STYLE, WS_CAPTION, WS_EX_TOPMOST,
+    };
+    let mut cloaked = 0u32;
+    if DwmGetWindowAttribute(
+        hwnd,
+        windows::Win32::Graphics::Dwm::DWMWA_CLOAKED,
+        &mut cloaked as *mut u32 as *mut _,
+        std::mem::size_of::<u32>() as u32,
+    )
+    .is_ok()
+        && cloaked != 0
+    {
+        return false;
+    }
+    let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+    let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+    is_capture_surface_shape(
+        ex_style & WS_EX_TOPMOST.0 != 0,
+        style & WS_CAPTION.0 == WS_CAPTION.0,
+    )
+}
+
+/// Pure decision behind [`is_capture_surface`].
+pub(crate) fn is_capture_surface_shape(topmost: bool, has_caption: bool) -> bool {
+    topmost || !has_caption
 }
 
 fn is_capture_ui_present() -> bool {
@@ -4195,6 +4235,19 @@ mod tests {
         notch_mode_reserves_work_area, win_number_index, window_reaches_dock,
     };
     use crate::types::IntRect;
+
+    #[test]
+    fn an_open_snipping_tool_window_does_not_disable_bloom() {
+        use super::is_capture_surface_shape;
+        // Measured on 26H2 build 26300 (Snipping Tool, German UI):
+        // the app window is captioned and not topmost, floating or maximized
+        // (maximized rect -11,-11,2891,1811 on a 2880x1800 monitor).
+        assert!(!is_capture_surface_shape(false, true));
+        // Each per-monitor "Snipping Tool Überlagerung" overlay is a topmost
+        // tool window that still carries the caption bits.
+        assert!(is_capture_surface_shape(true, true));
+        assert!(is_capture_surface_shape(false, false)); // borderless surface
+    }
 
     #[test]
     fn only_windows_on_the_primary_monitor_cover_the_dock() {
