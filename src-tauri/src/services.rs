@@ -1355,7 +1355,8 @@ pub fn setup_system_worker(app_handle: AppHandle) -> Sender<SystemCommand> {
                 // and tool windows (floating overlays and widgets): they never cover the
                 // dock like an app does, so the app under them decides.
                 let mut check_count = 0;
-                while !hwnd.is_invalid() && check_count < 64 {
+                let mut found_window = false;
+                while !hwnd.is_invalid() && check_count < 512 {
                     let mut process_id = 0u32;
                     GetWindowThreadProcessId(hwnd, Some(&mut process_id));
 
@@ -1405,8 +1406,17 @@ pub fn setup_system_worker(app_handle: AppHandle) -> Sender<SystemCommand> {
                         .unwrap_or_default();
                         check_count += 1;
                     } else {
+                        found_window = true;
                         break;
                     }
+                }
+                // Running out of steps must not hand an unchecked window to the
+                // overlap test. With Bloom in front and no app window open, the
+                // walk crosses every hidden top-level window (200+ is normal), and
+                // the one at the old cap of 64 was sometimes a cloaked, screen-sized
+                // ApplicationFrameWindow: dock and notch hid on an empty desktop.
+                if !found_window {
+                    hwnd = HWND(std::ptr::null_mut());
                 }
 
                 let dock_span = DOCK_RECT
