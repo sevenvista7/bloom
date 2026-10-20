@@ -630,30 +630,12 @@ const Dock = memo(function Dock() {
 		}
 	};
 
-	// Some apps open their window only on a double-click of their tray icon
-	// (Steam), so a single tray activation shows nothing. A pinned item then
-	// does what the taskbar does for a pinned app without windows: it starts
-	// the saved target, which brings a single-instance app's window forward.
-	const launchIfTrayIgnored = (app: AppInfo) => {
-		window.setTimeout(async () => {
-			try {
-				const open = await invoke<AppInfo[]>("get_active_windows");
-				if (!open.some((w) => isSameApp(app, w))) {
-					await invoke("open_app", { appName: app.path });
-				}
-			} catch (e) {
-				console.error(`Failed to launch ${app.name} after its tray icon:`, e);
-			}
-		}, 1500);
-	};
-
 	const handleAppClick = async (app: AppInfo) => {
 		try {
 			if (app.path === "start") {
 				await invoke("open_app", { appName: "start" });
 			} else if (app.is_background && app.tray_ids?.length === 1) {
 				await invoke("activate_tray_icon", { trayId: app.tray_ids[0] });
-				if (app.is_pinned) launchIfTrayIgnored(app);
 			} else if (app.all_hwnds && app.all_hwnds.length > 1) {
 				// Several windows: bring the most recent forward, then cycle.
 				await invoke("focus_app_windows", { hwnds: app.all_hwnds.map(([hwnd]) => hwnd) });
