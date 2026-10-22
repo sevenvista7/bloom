@@ -3,6 +3,7 @@
 mod bluetooth;
 mod commands;
 mod dock_extras;
+mod overlay_window;
 mod services;
 mod settings_window;
 mod shelf;
@@ -313,6 +314,7 @@ fn main() {
             // take effect on a window that has never been shown. Show it once
             // to register it with the compositor, then hide immediately.
             if let Some(ov_win) = app.get_webview_window("overlay") {
+                crate::overlay_window::install(ov_win.hwnd()?).map_err(std::io::Error::other)?;
                 let _ = ov_win.show();
                 let _ = ov_win.hide();
                 let overlay_handle = app.handle().clone();
