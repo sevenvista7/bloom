@@ -2025,7 +2025,23 @@ pub fn hide_native_osd() {
 
 #[tauri::command]
 pub fn open_settings_window(app: AppHandle) {
-    if let Some(win) = app.get_webview_window("settings") {
+    // WebView2 creation deadlocks in synchronous Windows commands/tray callbacks.
+    // Keep every entry point non-blocking and create the window on a worker.
+    tauri::async_runtime::spawn_blocking(move || {
+        if SHUTTING_DOWN.load(Ordering::Relaxed) {
+            return;
+        }
+        let (win, created) = match crate::settings_window::get_or_create(&app) {
+            Ok(window) => window,
+            Err(error) => {
+                eprintln!("Failed to open Bloom settings: {error}");
+                return;
+            }
+        };
+        if created {
+            let _ = window_vibrancy::apply_mica(&win, None);
+            crate::services::watch_webview_process(&app, &win);
+        }
         let _ = win.show();
         let _ = win.unminimize();
         let _ = win.set_focus();
@@ -2039,7 +2055,14 @@ pub fn open_settings_window(app: AppHandle) {
                 let _ = SetForegroundWindow(hwnd);
             }
         }
-    }
+    });
+}
+
+#[tauri::command]
+pub async fn close_settings_window(app: AppHandle) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || crate::settings_window::close(&app))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -3781,6 +3804,18 @@ pub fn setup_settings_watcher(app: AppHandle) {
 #[cfg(test)]
 mod pwa_icon_tests {
     use super::*;
+
+    #[test]
+    fn closed_settings_does_not_load_a_webview_at_startup() {
+        let config: tauri::Config =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let settings = config.app.windows.iter().find(|w| w.label == "settings").unwrap();
+        assert!(
+            !settings.create,
+            "The closed settings window must stay a template, not start a renderer"
+        );
+        assert!(!settings.visible);
+    }
 
     #[test]
     fn bloom_launch_targets_reuse_the_running_settings_window() {

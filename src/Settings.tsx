@@ -66,7 +66,7 @@ function SettingsApp() {
 		e.preventDefault();
 		e.stopPropagation();
 		try {
-			await appWindow.hide();
+			await invoke("close_settings_window");
 		} catch {}
 	};
 
